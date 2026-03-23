@@ -17,6 +17,7 @@
     --on: #22c55e;
     --off: #71717a;
     --danger: #ef4444;
+    --dimmer: #f59e0b;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -101,13 +102,16 @@
     border: 1px solid var(--card-border);
     border-radius: 14px;
     padding: 16px;
-    display: flex;
-    align-items: center;
-    gap: 14px;
     transition: all 0.2s;
   }
 
   .device-card.unreachable { opacity: 0.5; }
+
+  .device-card-top {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
 
   .device-icon {
     width: 44px;
@@ -123,6 +127,7 @@
 
   .device-icon.on { background: rgba(34,197,94,0.15); }
   .device-icon.off { background: rgba(113,113,122,0.15); }
+  .device-icon.dimmer-on { background: rgba(245,158,11,0.15); }
 
   .device-info { flex: 1; min-width: 0; }
 
@@ -149,6 +154,7 @@
   }
 
   .device-state.on { color: var(--on); }
+  .device-state.dimmer-on { color: var(--dimmer); }
   .device-state.off { color: var(--off); }
 
   /* Toggle Switch */
@@ -185,8 +191,55 @@
 
   .toggle input:checked + .toggle-slider { background: var(--on); }
   .toggle input:checked + .toggle-slider::after { transform: translateX(22px); }
+  .toggle.dimmer input:checked + .toggle-slider { background: var(--dimmer); }
 
   .toggle.busy .toggle-slider { opacity: 0.5; pointer-events: none; }
+
+  /* Brightness Slider */
+  .brightness-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--card-border);
+  }
+
+  .brightness-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    min-width: 20px;
+    text-align: right;
+  }
+
+  .brightness-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 3px;
+    background: #3a3d4a;
+    outline: none;
+  }
+
+  .brightness-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--dimmer);
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  }
+
+  .brightness-value {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--dimmer);
+    min-width: 36px;
+    text-align: right;
+  }
 
   /* Status Bar */
   .status-bar {
@@ -292,9 +345,10 @@
 </div>
 
 <script>
-const API = '';  // Same origin
+const API = '';
 let devices = [];
 let refreshInterval = null;
+let brightnessTimers = {};
 
 async function discoverDevices() {
   const btn = document.getElementById('btn-refresh');
@@ -326,16 +380,61 @@ async function toggleDevice(ip) {
     const resp = await fetch(`${API}/api/device/${ip}/toggle`, { method: 'POST' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
-    // Update local state
     const dev = devices.find(d => d.ip === ip);
-    if (dev) dev.state = data.state;
+    if (dev) {
+      dev.state = data.state;
+      if (data.brightness !== undefined) dev.brightness = data.brightness;
+    }
     renderDevices();
     setStatus('ok', 'Connected');
   } catch (err) {
     setStatus('error', 'Toggle failed');
     console.error('Toggle failed:', err);
-    // Revert checkbox
     renderDevices();
+  }
+  updateTimestamp();
+}
+
+function onBrightnessInput(ip, value) {
+  // Update display immediately
+  const valEl = document.getElementById(`brightness-val-${ip.replace(/\./g, '-')}`);
+  if (valEl) valEl.textContent = value + '%';
+
+  // Debounce the actual API call
+  clearTimeout(brightnessTimers[ip]);
+  brightnessTimers[ip] = setTimeout(() => setBrightness(ip, parseInt(value)), 300);
+}
+
+async function setBrightness(ip, brightness) {
+  try {
+    const resp = await fetch(`${API}/api/device/${ip}/brightness`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ brightness })
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const dev = devices.find(d => d.ip === ip);
+    if (dev) {
+      dev.state = data.state;
+      if (data.brightness !== undefined) dev.brightness = data.brightness;
+    }
+    // Update just the state label without full re-render (avoids slider jump)
+    const card = document.querySelector(`[data-device-ip="${ip}"]`);
+    if (card) {
+      const stateEl = card.querySelector('.device-state');
+      const iconEl = card.querySelector('.device-icon');
+      if (dev && stateEl) {
+        const isOn = dev.state === 1;
+        stateEl.textContent = isOn ? `On - ${dev.brightness || 100}%` : 'Off';
+        stateEl.className = `device-state ${isOn ? 'dimmer-on' : 'off'}`;
+        iconEl.className = `device-icon ${isOn ? 'dimmer-on' : 'off'}`;
+      }
+    }
+    setStatus('ok', 'Connected');
+  } catch (err) {
+    setStatus('error', 'Brightness failed');
+    console.error('Brightness failed:', err);
   }
   updateTimestamp();
 }
@@ -351,6 +450,7 @@ async function setAll(state) {
       if (resp.ok) {
         const data = await resp.json();
         dev.state = data.state;
+        if (data.brightness !== undefined) dev.brightness = data.brightness;
       }
     } catch (err) {
       console.error(`Failed to set ${dev.name}:`, err);
@@ -369,6 +469,10 @@ async function refreshStates() {
         const data = await resp.json();
         if (dev.state !== data.state) {
           dev.state = data.state;
+          changed = true;
+        }
+        if (data.brightness !== undefined && dev.brightness !== data.brightness) {
+          dev.brightness = data.brightness;
           changed = true;
         }
       }
@@ -402,33 +506,59 @@ function renderDevices() {
 
   list.innerHTML = devices.map(dev => {
     const isOn = dev.state === 1;
+    const isDimmer = dev.isDimmer || dev.brightness !== undefined;
     const stateClass = dev.state === null ? 'unreachable' : '';
-    const stateLabel = dev.state === null ? 'Unreachable' : (isOn ? 'On' : 'Off');
-    const iconClass = dev.state === null ? 'off' : (isOn ? 'on' : 'off');
+    const iconClass = dev.state === null ? 'off' : (isOn ? (isDimmer ? 'dimmer-on' : 'on') : 'off');
+    const stateColorClass = dev.state === null ? 'off' : (isOn ? (isDimmer ? 'dimmer-on' : 'on') : 'off');
     const icon = getDeviceIcon(dev.model);
+    const ipSafe = dev.ip.replace(/\./g, '-');
+
+    let stateLabel;
+    if (dev.state === null) {
+      stateLabel = 'Unreachable';
+    } else if (isDimmer && isOn) {
+      stateLabel = `On - ${dev.brightness || 100}%`;
+    } else {
+      stateLabel = isOn ? 'On' : 'Off';
+    }
+
+    let brightnessHtml = '';
+    if (isDimmer && dev.state !== null) {
+      const bval = dev.brightness || 100;
+      brightnessHtml = `
+        <div class="brightness-row">
+          <span class="brightness-label">&#x2600;</span>
+          <input type="range" class="brightness-slider" min="1" max="100" value="${bval}"
+                 oninput="onBrightnessInput('${dev.ip}', this.value)">
+          <span class="brightness-value" id="brightness-val-${ipSafe}">${bval}%</span>
+        </div>`;
+    }
 
     return `
-      <div class="device-card ${stateClass}">
-        <div class="device-icon ${iconClass}">${icon}</div>
-        <div class="device-info">
-          <div class="device-name">${escHtml(dev.name)}</div>
-          <div class="device-meta">${escHtml(dev.model)} &middot; ${dev.ip}</div>
-          <div class="device-state ${iconClass}">${stateLabel}</div>
+      <div class="device-card ${stateClass}" data-device-ip="${dev.ip}">
+        <div class="device-card-top">
+          <div class="device-icon ${iconClass}">${icon}</div>
+          <div class="device-info">
+            <div class="device-name">${escHtml(dev.name)}</div>
+            <div class="device-meta">${escHtml(dev.model)} &middot; ${dev.ip}</div>
+            <div class="device-state ${stateColorClass}">${stateLabel}</div>
+          </div>
+          ${dev.state !== null ? `
+          <label class="toggle ${isDimmer ? 'dimmer' : ''}">
+            <input type="checkbox" data-ip="${dev.ip}" ${isOn ? 'checked' : ''} onchange="toggleDevice('${dev.ip}')">
+            <span class="toggle-slider"></span>
+          </label>` : ''}
         </div>
-        ${dev.state !== null ? `
-        <label class="toggle">
-          <input type="checkbox" data-ip="${dev.ip}" ${isOn ? 'checked' : ''} onchange="toggleDevice('${dev.ip}')">
-          <span class="toggle-slider"></span>
-        </label>` : ''}
+        ${brightnessHtml}
       </div>`;
   }).join('');
 }
 
 function getDeviceIcon(model) {
   const m = (model || '').toLowerCase();
+  if (m.includes('dimmer')) return '&#x1F506;';
   if (m.includes('lightswitch') || m.includes('light')) return '&#x1F4A1;';
   if (m.includes('insight')) return '&#x26A1;';
-  if (m.includes('dimmer')) return '&#x1F506;';
   if (m.includes('plug') || m.includes('switch')) return '&#x1F50C;';
   return '&#x1F50C;';
 }
@@ -452,7 +582,6 @@ function updateTimestamp() {
 
 // Init
 discoverDevices();
-// Refresh states every 10 seconds
 refreshInterval = setInterval(refreshStates, 10000);
 </script>
 </body>

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Wemo Control Server - Zero-dependency local web server for controlling Wemo switches."""
+"""Wemo Control Server - Zero-dependency local web server for controlling Wemo switches and dimmers."""
 
+import concurrent.futures
 import json
 import os
 import re
@@ -34,12 +35,37 @@ SOAP_SET_STATE = """<?xml version="1.0" encoding="utf-8"?>
 </s:Body>
 </s:Envelope>"""
 
+SOAP_SET_BRIGHTNESS = """<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+ s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:SetBinaryState xmlns:u="urn:Belkin:service:basicevent:1">
+<BinaryState>{state}</BinaryState>
+<brightness>{brightness}</brightness>
+</u:SetBinaryState>
+</s:Body>
+</s:Envelope>"""
+
 # Cache discovered devices to avoid repeated scans
 _device_cache = {}
 _cache_lock = threading.Lock()
 
 
-def ssdp_discover(timeout=5):
+def _check_wemo_port(ip, port):
+    """Check if a Wemo device is listening on ip:port."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        if result == 0:
+            return (ip, port)
+    except Exception:
+        pass
+    return None
+
+
+def ssdp_discover(timeout=3):
     """Discover Wemo devices on the network via SSDP."""
     targets = [
         "urn:Belkin:device:controllee:1",
@@ -82,6 +108,46 @@ def ssdp_discover(timeout=5):
     return found
 
 
+def port_scan_discover():
+    """Find Wemo devices via port scanning (catches dimmers that don't respond to SSDP)."""
+    # Get local IP to determine subnet
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        return {}
+
+    subnet = ".".join(local_ip.split(".")[:3])
+    targets = []
+    for i in range(1, 255):
+        ip = f"{subnet}.{i}"
+        if ip == local_ip:
+            continue
+        for port in [49152, 49153]:
+            targets.append((ip, port))
+
+    found = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as ex:
+        futures = {ex.submit(_check_wemo_port, ip, port): (ip, port) for ip, port in targets}
+        for f in concurrent.futures.as_completed(futures):
+            result = f.result()
+            if result:
+                ip, port = result
+                # Try to fetch setup.xml to confirm it's a Wemo device
+                try:
+                    req = Request(f"http://{ip}:{port}/setup.xml",
+                                  headers={"User-Agent": "WemoControl/1.0"})
+                    with urlopen(req, timeout=2) as resp:
+                        xml = resp.read().decode("utf-8", errors="ignore")
+                    if "belkin" in xml.lower():
+                        found[ip] = f"http://{ip}:{port}/setup.xml"
+                except Exception:
+                    pass
+    return found
+
+
 def fetch_device_info(ip, location):
     """Fetch device name and model from its setup.xml."""
     try:
@@ -93,9 +159,9 @@ def fetch_device_info(ip, location):
         device_type = re.search(r"<deviceType>(.+?)</deviceType>", xml)
         serial = re.search(r"<serialNumber>(.+?)</serialNumber>", xml)
         firmware = re.search(r"<firmwareVersion>(.+?)</firmwareVersion>", xml)
-        # Extract port from location URL
         parsed = urlparse(location)
         port = parsed.port or 49153
+        is_dimmer = "dimmer" in (device_type.group(1) if device_type else "").lower()
         return {
             "ip": ip,
             "port": port,
@@ -104,15 +170,16 @@ def fetch_device_info(ip, location):
             "type": device_type.group(1) if device_type else "Unknown",
             "serial": serial.group(1) if serial else "Unknown",
             "firmware": firmware.group(1) if firmware else "Unknown",
+            "isDimmer": is_dimmer,
         }
     except Exception as e:
         return {"ip": ip, "port": 49153, "name": ip, "model": "Unknown",
                 "type": "Unknown", "serial": "Unknown", "firmware": "Unknown",
-                "error": str(e)}
+                "isDimmer": False, "error": str(e)}
 
 
 def get_wemo_state(ip, port=49153):
-    """Get the current binary state of a Wemo device."""
+    """Get the current state (and brightness for dimmers) of a Wemo device."""
     url = f"http://{ip}:{port}/upnp/control/basicevent1"
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
@@ -122,29 +189,42 @@ def get_wemo_state(ip, port=49153):
     try:
         with urlopen(req, timeout=5) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
-        match = re.search(r"<BinaryState>(\d+)</BinaryState>", body)
-        if match:
-            return int(match.group(1))
+        state_match = re.search(r"<BinaryState>(\d+)</BinaryState>", body)
+        brightness_match = re.search(r"<brightness>(\d+)</brightness>", body)
+        result = {}
+        if state_match:
+            result["state"] = int(state_match.group(1))
+        if brightness_match:
+            result["brightness"] = int(brightness_match.group(1))
+        return result if result else None
     except Exception:
         pass
     return None
 
 
-def set_wemo_state(ip, state, port=49153):
-    """Set the binary state of a Wemo device (0=off, 1=on)."""
+def set_wemo_state(ip, state, port=49153, brightness=None):
+    """Set the state (and optionally brightness) of a Wemo device."""
     url = f"http://{ip}:{port}/upnp/control/basicevent1"
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
         "SOAPACTION": '"urn:Belkin:service:basicevent:1#SetBinaryState"',
     }
-    body = SOAP_SET_STATE.format(state=state)
+    if brightness is not None:
+        body = SOAP_SET_BRIGHTNESS.format(state=state, brightness=brightness)
+    else:
+        body = SOAP_SET_STATE.format(state=state)
     req = Request(url, data=body.encode(), headers=headers, method="POST")
     try:
         with urlopen(req, timeout=5) as resp:
             result = resp.read().decode("utf-8", errors="ignore")
-        match = re.search(r"<BinaryState>(\d+)</BinaryState>", result)
-        if match:
-            return int(match.group(1))
+        state_match = re.search(r"<BinaryState>(\d+)</BinaryState>", result)
+        brightness_match = re.search(r"<brightness>(\d+)</brightness>", result)
+        out = {}
+        if state_match:
+            out["state"] = int(state_match.group(1))
+        if brightness_match:
+            out["brightness"] = int(brightness_match.group(1))
+        return out if out else None
     except Exception:
         pass
     return None
@@ -169,6 +249,8 @@ class WemoHandler(SimpleHTTPRequestHandler):
             self._handle_toggle()
         elif self.path.startswith("/api/device/") and self.path.endswith("/state"):
             self._handle_set_state()
+        elif self.path.startswith("/api/device/") and self.path.endswith("/brightness"):
+            self._handle_set_brightness()
         else:
             self._send_json({"error": "Not found"}, 404)
 
@@ -188,24 +270,39 @@ class WemoHandler(SimpleHTTPRequestHandler):
         return 49153
 
     def _handle_discover(self):
-        """Discover Wemo devices and return their info + state."""
-        found = ssdp_discover(timeout=3)
+        """Discover Wemo devices via SSDP + port scan, return info + state."""
+        # Run SSDP and port scan
+        ssdp_found = ssdp_discover(timeout=3)
+        scan_found = port_scan_discover()
+        # Merge results (port scan fills gaps from SSDP)
+        all_found = {**scan_found, **ssdp_found}
+
         devices = []
-        for ip, location in found.items():
+        for ip, location in all_found.items():
             info = fetch_device_info(ip, location)
-            state = get_wemo_state(ip, info.get("port", 49153))
-            info["state"] = state
+            state_info = get_wemo_state(ip, info.get("port", 49153))
+            if state_info:
+                info["state"] = state_info.get("state")
+                if "brightness" in state_info:
+                    info["brightness"] = state_info["brightness"]
+                    info["isDimmer"] = True
+            else:
+                info["state"] = None
             devices.append(info)
             with _cache_lock:
                 _device_cache[ip] = info
-        # Also check cached devices that might not have responded to this scan
+
+        # Also check cached devices that might not have responded
         with _cache_lock:
-            for ip, cached in _device_cache.items():
-                if ip not in found:
-                    state = get_wemo_state(ip, cached.get("port", 49153))
-                    if state is not None:
-                        cached["state"] = state
+            for ip, cached in list(_device_cache.items()):
+                if ip not in all_found:
+                    state_info = get_wemo_state(ip, cached.get("port", 49153))
+                    if state_info:
+                        cached["state"] = state_info.get("state")
+                        if "brightness" in state_info:
+                            cached["brightness"] = state_info["brightness"]
                         devices.append(cached)
+
         devices.sort(key=lambda d: d.get("name", ""))
         self._send_json({"devices": devices})
 
@@ -215,9 +312,9 @@ class WemoHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "Missing IP"}, 400)
             return
         port = self._get_device_port(ip)
-        state = get_wemo_state(ip, port)
-        if state is not None:
-            self._send_json({"ip": ip, "state": state})
+        state_info = get_wemo_state(ip, port)
+        if state_info:
+            self._send_json({"ip": ip, **state_info})
         else:
             self._send_json({"error": "Device not responding"}, 503)
 
@@ -227,14 +324,15 @@ class WemoHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "Missing IP"}, 400)
             return
         port = self._get_device_port(ip)
-        current = get_wemo_state(ip, port)
-        if current is None:
+        state_info = get_wemo_state(ip, port)
+        if not state_info:
             self._send_json({"error": "Device not responding"}, 503)
             return
+        current = state_info.get("state", 0)
         new_state = 0 if current else 1
         result = set_wemo_state(ip, new_state, port)
-        if result is not None:
-            self._send_json({"ip": ip, "state": result})
+        if result:
+            self._send_json({"ip": ip, **result})
         else:
             self._send_json({"error": "Failed to set state"}, 500)
 
@@ -255,11 +353,37 @@ class WemoHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "state must be 0 or 1"}, 400)
             return
         port = self._get_device_port(ip)
-        result = set_wemo_state(ip, state, port)
-        if result is not None:
-            self._send_json({"ip": ip, "state": result})
+        brightness = data.get("brightness")
+        result = set_wemo_state(ip, state, port, brightness=brightness)
+        if result:
+            self._send_json({"ip": ip, **result})
         else:
             self._send_json({"error": "Failed to set state"}, 500)
+
+    def _handle_set_brightness(self):
+        ip = self._extract_ip()
+        if not ip:
+            self._send_json({"error": "Missing IP"}, 400)
+            return
+        content_len = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_len).decode() if content_len else "{}"
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON"}, 400)
+            return
+        brightness = data.get("brightness")
+        if brightness is None or not (0 <= brightness <= 100):
+            self._send_json({"error": "brightness must be 0-100"}, 400)
+            return
+        port = self._get_device_port(ip)
+        # If brightness > 0, ensure device is on
+        state = 1 if brightness > 0 else 0
+        result = set_wemo_state(ip, state, port, brightness=brightness)
+        if result:
+            self._send_json({"ip": ip, **result})
+        else:
+            self._send_json({"error": "Failed to set brightness"}, 500)
 
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode()
@@ -271,14 +395,12 @@ class WemoHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        # Quieter logging - only log API calls
         if "/api/" in (args[0] if args else ""):
             super().log_message(format, *args)
 
 
 def main():
     server = HTTPServer(("0.0.0.0", PORT), WemoHandler)
-    # Get local IP for display
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
