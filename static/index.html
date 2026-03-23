@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Wemo Control</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --card-border: #2a2d3a;
+    --text: #e4e4e7;
+    --text-dim: #71717a;
+    --accent: #3b82f6;
+    --on: #22c55e;
+    --off: #71717a;
+    --danger: #ef4444;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .container {
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 20px 16px;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--card-border);
+  }
+
+  header h1 {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.5px;
+  }
+
+  header .subtitle {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .btn {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    color: var(--text);
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .btn:active { transform: scale(0.96); }
+  .btn:hover { border-color: var(--accent); }
+
+  .btn-icon {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .btn.scanning {
+    pointer-events: none;
+    opacity: 0.6;
+  }
+
+  .btn.scanning .icon-refresh { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Device Cards */
+  .devices { display: flex; flex-direction: column; gap: 12px; }
+
+  .device-card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 16px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    transition: all 0.2s;
+  }
+
+  .device-card.unreachable { opacity: 0.5; }
+
+  .device-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }
+
+  .device-icon.on { background: rgba(34,197,94,0.15); }
+  .device-icon.off { background: rgba(113,113,122,0.15); }
+
+  .device-info { flex: 1; min-width: 0; }
+
+  .device-name {
+    font-size: 15px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .device-meta {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  .device-state {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
+  }
+
+  .device-state.on { color: var(--on); }
+  .device-state.off { color: var(--off); }
+
+  /* Toggle Switch */
+  .toggle {
+    position: relative;
+    width: 52px;
+    height: 30px;
+    flex-shrink: 0;
+  }
+
+  .toggle input { display: none; }
+
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: #3a3d4a;
+    border-radius: 15px;
+    cursor: pointer;
+    transition: background 0.3s;
+  }
+
+  .toggle-slider::after {
+    content: '';
+    position: absolute;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: white;
+    top: 3px;
+    left: 3px;
+    transition: transform 0.3s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+
+  .toggle input:checked + .toggle-slider { background: var(--on); }
+  .toggle input:checked + .toggle-slider::after { transform: translateX(22px); }
+
+  .toggle.busy .toggle-slider { opacity: 0.5; pointer-events: none; }
+
+  /* Status Bar */
+  .status-bar {
+    margin-top: 24px;
+    padding: 10px 14px;
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 6px;
+  }
+
+  .status-dot.ok { background: var(--on); }
+  .status-dot.error { background: var(--danger); }
+
+  /* Loading */
+  .loading {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-dim);
+  }
+
+  .loading-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--card-border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto 16px;
+  }
+
+  /* Empty state */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-dim);
+  }
+
+  .empty-state .icon { font-size: 40px; margin-bottom: 12px; }
+
+  /* All-controls bar */
+  .all-controls {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+
+  .all-controls .btn {
+    flex: 1;
+    justify-content: center;
+    font-weight: 500;
+  }
+
+  .all-controls .btn-on:hover { border-color: var(--on); color: var(--on); }
+  .all-controls .btn-off:hover { border-color: var(--danger); color: var(--danger); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div>
+      <h1>Wemo Control</h1>
+      <div class="subtitle" id="device-count">Discovering devices...</div>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-icon" onclick="discoverDevices()" id="btn-refresh" title="Scan for devices">
+        <svg class="icon-refresh" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M13.5 8a5.5 5.5 0 01-9.78 3.44M2.5 8a5.5 5.5 0 019.78-3.44"/>
+          <path d="M13.5 3v3.5H10M2.5 13V9.5H6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="all-controls" id="all-controls" style="display:none">
+    <button class="btn btn-on" onclick="setAll(1)">All On</button>
+    <button class="btn btn-off" onclick="setAll(0)">All Off</button>
+  </div>
+
+  <div id="device-list" class="devices">
+    <div class="loading">
+      <div class="loading-spinner"></div>
+      Scanning network for Wemo devices...
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar">
+    <span><span class="status-dot ok" id="status-dot"></span><span id="status-text">Connected</span></span>
+    <span id="last-update">--</span>
+  </div>
+</div>
+
+<script>
+const API = '';  // Same origin
+let devices = [];
+let refreshInterval = null;
+
+async function discoverDevices() {
+  const btn = document.getElementById('btn-refresh');
+  btn.classList.add('scanning');
+  document.getElementById('device-count').textContent = 'Scanning...';
+
+  try {
+    const resp = await fetch(`${API}/api/devices`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    devices = data.devices || [];
+    renderDevices();
+    setStatus('ok', 'Connected');
+  } catch (err) {
+    setStatus('error', 'Scan failed');
+    console.error('Discovery failed:', err);
+  } finally {
+    btn.classList.remove('scanning');
+    updateTimestamp();
+  }
+}
+
+async function toggleDevice(ip) {
+  const toggle = document.querySelector(`[data-ip="${ip}"]`);
+  if (!toggle) return;
+  toggle.closest('.toggle').classList.add('busy');
+
+  try {
+    const resp = await fetch(`${API}/api/device/${ip}/toggle`, { method: 'POST' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    // Update local state
+    const dev = devices.find(d => d.ip === ip);
+    if (dev) dev.state = data.state;
+    renderDevices();
+    setStatus('ok', 'Connected');
+  } catch (err) {
+    setStatus('error', 'Toggle failed');
+    console.error('Toggle failed:', err);
+    // Revert checkbox
+    renderDevices();
+  }
+  updateTimestamp();
+}
+
+async function setAll(state) {
+  for (const dev of devices) {
+    try {
+      const resp = await fetch(`${API}/api/device/${dev.ip}/state`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        dev.state = data.state;
+      }
+    } catch (err) {
+      console.error(`Failed to set ${dev.name}:`, err);
+    }
+  }
+  renderDevices();
+  updateTimestamp();
+}
+
+async function refreshStates() {
+  let changed = false;
+  for (const dev of devices) {
+    try {
+      const resp = await fetch(`${API}/api/device/${dev.ip}/state`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (dev.state !== data.state) {
+          dev.state = data.state;
+          changed = true;
+        }
+      }
+    } catch (err) {
+      // Device may be unreachable
+    }
+  }
+  if (changed) renderDevices();
+  updateTimestamp();
+}
+
+function renderDevices() {
+  const list = document.getElementById('device-list');
+  const controls = document.getElementById('all-controls');
+  const count = document.getElementById('device-count');
+
+  if (devices.length === 0) {
+    list.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">&#x1F50C;</div>
+        <p>No Wemo devices found</p>
+        <p style="margin-top:8px;font-size:13px">Make sure your devices are powered on and connected to the same network.</p>
+      </div>`;
+    controls.style.display = 'none';
+    count.textContent = 'No devices found';
+    return;
+  }
+
+  count.textContent = `${devices.length} device${devices.length !== 1 ? 's' : ''}`;
+  controls.style.display = 'flex';
+
+  list.innerHTML = devices.map(dev => {
+    const isOn = dev.state === 1;
+    const stateClass = dev.state === null ? 'unreachable' : '';
+    const stateLabel = dev.state === null ? 'Unreachable' : (isOn ? 'On' : 'Off');
+    const iconClass = dev.state === null ? 'off' : (isOn ? 'on' : 'off');
+    const icon = getDeviceIcon(dev.model);
+
+    return `
+      <div class="device-card ${stateClass}">
+        <div class="device-icon ${iconClass}">${icon}</div>
+        <div class="device-info">
+          <div class="device-name">${escHtml(dev.name)}</div>
+          <div class="device-meta">${escHtml(dev.model)} &middot; ${dev.ip}</div>
+          <div class="device-state ${iconClass}">${stateLabel}</div>
+        </div>
+        ${dev.state !== null ? `
+        <label class="toggle">
+          <input type="checkbox" data-ip="${dev.ip}" ${isOn ? 'checked' : ''} onchange="toggleDevice('${dev.ip}')">
+          <span class="toggle-slider"></span>
+        </label>` : ''}
+      </div>`;
+  }).join('');
+}
+
+function getDeviceIcon(model) {
+  const m = (model || '').toLowerCase();
+  if (m.includes('lightswitch') || m.includes('light')) return '&#x1F4A1;';
+  if (m.includes('insight')) return '&#x26A1;';
+  if (m.includes('dimmer')) return '&#x1F506;';
+  if (m.includes('plug') || m.includes('switch')) return '&#x1F50C;';
+  return '&#x1F50C;';
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+function setStatus(type, text) {
+  document.getElementById('status-dot').className = `status-dot ${type}`;
+  document.getElementById('status-text').textContent = text;
+}
+
+function updateTimestamp() {
+  const now = new Date();
+  document.getElementById('last-update').textContent =
+    now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// Init
+discoverDevices();
+// Refresh states every 10 seconds
+refreshInterval = setInterval(refreshStates, 10000);
+</script>
+</body>
+</html>
