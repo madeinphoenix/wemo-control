@@ -108,9 +108,9 @@ def ssdp_discover(timeout=3):
     return found
 
 
-def port_scan_discover():
+def port_scan_discover(exclude_ips=None):
     """Find Wemo devices via port scanning (catches dimmers that don't respond to SSDP)."""
-    # Get local IP to determine subnet
+    exclude_ips = exclude_ips or set()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -123,19 +123,20 @@ def port_scan_discover():
     targets = []
     for i in range(1, 255):
         ip = f"{subnet}.{i}"
-        if ip == local_ip:
+        if ip == local_ip or ip in exclude_ips:
             continue
         for port in [49152, 49153]:
             targets.append((ip, port))
 
     found = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=150) as ex:
         futures = {ex.submit(_check_wemo_port, ip, port): (ip, port) for ip, port in targets}
         for f in concurrent.futures.as_completed(futures):
             result = f.result()
             if result:
                 ip, port = result
-                # Try to fetch setup.xml to confirm it's a Wemo device
+                if ip in found:
+                    continue
                 try:
                     req = Request(f"http://{ip}:{port}/setup.xml",
                                   headers={"User-Agent": "WemoControl/1.0"})
@@ -270,16 +271,26 @@ class WemoHandler(SimpleHTTPRequestHandler):
         return 49153
 
     def _handle_discover(self):
-        """Discover Wemo devices via SSDP + port scan, return info + state."""
-        # Run SSDP and port scan
+        """Discover Wemo devices via SSDP + cached devices, with background port scan."""
         ssdp_found = ssdp_discover(timeout=3)
-        scan_found = port_scan_discover()
-        # Merge results (port scan fills gaps from SSDP)
-        all_found = {**scan_found, **ssdp_found}
+
+        # Build results from SSDP + cache
+        all_found = dict(ssdp_found)
+        with _cache_lock:
+            for ip, cached in _device_cache.items():
+                if ip not in all_found:
+                    port = cached.get("port", 49153)
+                    all_found[ip] = f"http://{ip}:{port}/setup.xml"
 
         devices = []
         for ip, location in all_found.items():
-            info = fetch_device_info(ip, location)
+            # Use cached info if available, otherwise fetch
+            with _cache_lock:
+                cached = _device_cache.get(ip)
+            if cached and ip not in ssdp_found:
+                info = dict(cached)
+            else:
+                info = fetch_device_info(ip, location)
             state_info = get_wemo_state(ip, info.get("port", 49153))
             if state_info:
                 info["state"] = state_info.get("state")
@@ -292,19 +303,26 @@ class WemoHandler(SimpleHTTPRequestHandler):
             with _cache_lock:
                 _device_cache[ip] = info
 
-        # Also check cached devices that might not have responded
-        with _cache_lock:
-            for ip, cached in list(_device_cache.items()):
-                if ip not in all_found:
-                    state_info = get_wemo_state(ip, cached.get("port", 49153))
-                    if state_info:
-                        cached["state"] = state_info.get("state")
-                        if "brightness" in state_info:
-                            cached["brightness"] = state_info["brightness"]
-                        devices.append(cached)
-
         devices.sort(key=lambda d: d.get("name", ""))
         self._send_json({"devices": devices})
+
+        # Run port scan in background to find devices SSDP missed (e.g. dimmers)
+        def _bg_scan():
+            with _cache_lock:
+                known = set(_device_cache.keys())
+            scan_found = port_scan_discover(exclude_ips=known)
+            for ip, location in scan_found.items():
+                info = fetch_device_info(ip, location)
+                state_info = get_wemo_state(ip, info.get("port", 49153))
+                if state_info:
+                    info["state"] = state_info.get("state")
+                    if "brightness" in state_info:
+                        info["brightness"] = state_info["brightness"]
+                        info["isDimmer"] = True
+                with _cache_lock:
+                    _device_cache[ip] = info
+
+        threading.Thread(target=_bg_scan, daemon=True).start()
 
     def _handle_get_state(self):
         ip = self._extract_ip()
@@ -399,6 +417,37 @@ class WemoHandler(SimpleHTTPRequestHandler):
             super().log_message(format, *args)
 
 
+def _startup_scan():
+    """Run initial discovery at startup to pre-populate cache."""
+    print("Running startup device scan...")
+    ssdp_found = ssdp_discover(timeout=3)
+    for ip, location in ssdp_found.items():
+        info = fetch_device_info(ip, location)
+        state_info = get_wemo_state(ip, info.get("port", 49153))
+        if state_info:
+            info["state"] = state_info.get("state")
+            if "brightness" in state_info:
+                info["brightness"] = state_info["brightness"]
+                info["isDimmer"] = True
+        with _cache_lock:
+            _device_cache[ip] = info
+    # Port scan for devices SSDP missed
+    scan_found = port_scan_discover(exclude_ips=set(ssdp_found.keys()))
+    for ip, location in scan_found.items():
+        info = fetch_device_info(ip, location)
+        state_info = get_wemo_state(ip, info.get("port", 49153))
+        if state_info:
+            info["state"] = state_info.get("state")
+            if "brightness" in state_info:
+                info["brightness"] = state_info["brightness"]
+                info["isDimmer"] = True
+        with _cache_lock:
+            _device_cache[ip] = info
+    with _cache_lock:
+        count = len(_device_cache)
+    print(f"Found {count} device(s) on startup.")
+
+
 def main():
     server = HTTPServer(("0.0.0.0", PORT), WemoHandler)
     try:
@@ -408,6 +457,10 @@ def main():
         s.close()
     except Exception:
         local_ip = "localhost"
+
+    # Pre-populate cache in background so first page load is fast
+    threading.Thread(target=_startup_scan, daemon=True).start()
+
     print(f"Wemo Control Server running on:")
     print(f"  Local:   http://localhost:{PORT}")
     print(f"  Network: http://{local_ip}:{PORT}")
